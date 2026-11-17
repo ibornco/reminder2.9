@@ -627,8 +627,11 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
             modifier = Modifier.fillMaxSize(),
             factory = { viewContext ->
                 VideoView(viewContext).apply {
-                    setVideoURI(Uri.parse("android.resource://${viewContext.packageName}/${R.raw.loading_intro}"))
-                    setOnPreparedListener { player -> player.isLooping = true; start() }
+                    val videoResourceId = viewContext.resources.getIdentifier("loading_intro", "raw", viewContext.packageName)
+                    if (videoResourceId != 0) {
+                        setVideoURI(Uri.parse("android.resource://${viewContext.packageName}/$videoResourceId"))
+                        setOnPreparedListener { player -> player.isLooping = true; start() }
+                    }
                 }
             },
             update = { if (!it.isPlaying) it.start() },
@@ -752,7 +755,7 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
                         val dayShifts = shifts.filter { it.date == iso }
                         val selectedDay = date == iso
                         Box(Modifier.weight(1f).height(43.dp).padding(2.dp).background(if(selectedDay) StoreMint.copy(alpha=.22f) else Color.Transparent,RoundedCornerShape(11.dp)).clickable { date=iso; if(day.month!=month.month) month=day.withDayOfMonth(1) },contentAlignment=Alignment.Center) {
-                            Column(horizontalAlignment=Alignment.CenterVertically,verticalArrangement=Arrangement.spacedBy(0.dp)) {
+                            Column(horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(0.dp)) {
                                 Text(if(LocalStoreEnglish.current) day.dayOfMonth.toString() else day.dayOfMonth.toString().map { ch -> if(ch in '0'..'9') ('۰'.code + (ch-'0')).toChar() else ch }.joinToString(""),color=if(day.month==month.month) StoreInk else StoreMuted.copy(alpha=.35f),fontSize=11.sp,fontWeight=if(selectedDay) FontWeight.Bold else FontWeight.Normal)
                                 if(dayShifts.isNotEmpty()) Text("•",color=if(dayShifts.any { it.type=="full_day" }) StoreMint else Color(0xFFF6C66A),fontSize=12.sp,lineHeight=10.sp)
                             }
