@@ -1,5 +1,13 @@
 package com.iborn.reminder
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.tween
+
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -133,7 +141,7 @@ data class StoreProfile(val id: Int, val username: String, val displayName: Stri
 data class StoreTask(val id: Int, val title: String, val shift: String, val date: String, val assignedName: String?, val done: Boolean, val doneCount: Int = 0, val memberCount: Int = 0)
 data class StoreStaff(val id: Int, val username: String, val name: String, val active: Boolean)
 data class StoreShift(val id: Int, val date: String, val type: String, val start: String, val end: String, val members: List<String>, val memberIds: List<Int> = emptyList())
-data class StoreProduct(val id: Int, val batchId: Int, val name: String, val category: String, val barcode: String, val expiry: String, val quantity: Int)
+data class StoreProduct(val id: Int, val batchId: Int, val name: String, val category: String, val barcode: String, val expiry: String, val quantity: Int, val checkedQuantity: Int? = null, val checkedAt: String = "", val checkedBy: String = "")
 data class StoreOverview(val taskCount: Int = 0, val doneCount: Int = 0, val shiftCount: Int = 0, val batchCount: Int = 0, val expiringCount: Int = 0, val role: String = "")
 
 class StoreHttpException(val statusCode: Int, message: String) : IllegalStateException(message)
@@ -243,7 +251,12 @@ class StoreApiClient(context: Context) {
             val c = (URL("$STORE_BASE_URL/health").openConnection() as HttpURLConnection).apply { connectTimeout = 5000; readTimeout = 5000; requestMethod = "GET" }
             try {
                 val code = c.responseCode
-                if (code in 200..299) StoreConnectionState.ONLINE else StoreConnectionState.SERVER_ERROR
+                if (code in 200..299) StoreConnectionState.ONLINE
+                else {
+                    // The health route can be unavailable or misconfigured while authenticated API routes still work.
+                    runCatching { call("GET", "/products", queueOnOffline = false) }
+                        .fold({ StoreConnectionState.ONLINE }, { StoreConnectionState.SERVER_ERROR })
+                }
             } finally { c.disconnect() }
         } catch (_: Exception) {
             val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -407,7 +420,7 @@ class StoreApiClient(context: Context) {
     suspend fun deleteTask(id: Int) { call("DELETE", "/tasks/$id") }
     suspend fun products(): List<StoreProduct> {
         val a = call("GET", "/products").optJSONArray("products") ?: JSONArray()
-        val result = (0 until a.length()).map { a.getJSONObject(it).let { x -> StoreProduct(x.getInt("id"), x.optInt("batch_id"), x.getString("name"), x.optString("category"), x.optString("barcode"), x.optString("expiry_date"), x.optInt("quantity")) } }.toMutableList()
+        val result = (0 until a.length()).map { a.getJSONObject(it).let { x -> StoreProduct(x.getInt("id"), x.optInt("batch_id"), x.getString("name"), x.optString("category"), x.optString("barcode"), x.optString("expiry_date"), x.optInt("quantity"), if (x.isNull("checked_quantity")) null else x.optInt("checked_quantity"), x.optString("checked_at"), x.optString("checked_by")) } }.toMutableList()
         pendingOperations().forEach { op ->
             val path=op.optString("path"); val method=op.optString("method"); val body=op.optJSONObject("body")
             if(path=="/products" && method=="POST" && body!=null) {
@@ -433,6 +446,9 @@ class StoreApiClient(context: Context) {
     suspend fun updateBatchQuantity(batchId: Int, quantity: Int) {
         call("PATCH", "/batches/$batchId", JSONObject().put("quantity", quantity).put("shift_date", LocalDate.now().toString()))
     }
+    suspend fun checkBatchQuantity(batchId: Int, quantity: Int) {
+        call("POST", "/batches/$batchId/check", JSONObject().put("counted_quantity", quantity).put("shift_date", LocalDate.now().toString()))
+    }
     fun clearLocalSession() { token = "" }
     suspend fun logout() { if (token.isNotBlank()) runCatching { call("POST", "/auth/logout", JSONObject(), queueOnOffline = false) }; clearLocalSession() }
 }
@@ -453,9 +469,9 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
     var connectionState by remember { mutableStateOf(StoreConnectionState.CHECKING) }
     var pendingChanges by remember { mutableIntStateOf(api.pendingCount()) }
 
-    fun refresh() {
+    fun refresh(showLoading: Boolean = true) {
         scope.launch {
-            loading = true; dataReady = false; error = ""
+            if (showLoading) { loading = true; dataReady = false }; error = ""
             try {
                 coroutineScope {
                     val manager = profile?.role == "manager"
@@ -483,7 +499,7 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
                 error = e.message ?: "Could not load Store data"
                 if (e.statusCode == 401) { api.clearLocalSession(); profile = null; persistStoreProfile(context, null) }
             } catch (e: Exception) { error = if (e is IOException) "Vpn khod ra roshn konid" else (e.message ?: "Could not load Store data") }
-            finally { loading = false; dataReady = true; pendingChanges = api.pendingCount() }
+            finally { if (showLoading) { loading = false; dataReady = true }; pendingChanges = api.pendingCount() }
         }
     }
     val pullRefreshThreshold = with(androidx.compose.ui.platform.LocalDensity.current) { 72.dp.toPx() }
@@ -521,7 +537,7 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
                     if (pendingChanges == 0) refresh()
                 } else if (connectionState == StoreConnectionState.ONLINE && pendingChanges == 0 && pollCount % 4 == 0 && !loading) {
                     // Keep shared stock counts and task state fresh while the store workspace is open.
-                    refresh()
+                    refresh(showLoading = false)
                 }
                 pendingChanges = api.pendingCount()
                 pollCount++
@@ -631,11 +647,21 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
                 tabs.forEach { tab -> FilterChip(selected = page == tab, onClick = { page = tab }, label = { Text(storeText(tab), fontSize = 11.sp) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = StoreMint, selectedLabelColor = StoreBlack)) }
             }
             if (loading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = StoreMint)
-            when (page) {
-                "Staff" -> ManagerStaff(staff, modifier = Modifier.weight(1f), onCreate = { u, n, p -> scope.launch { runCatching { api.createStaff(u,n,p); staff=api.staff() }.onFailure { error=it.message ?: "Create failed" } } }, onToggle = { id, active -> scope.launch { runCatching { api.setStaffActive(id,active); staff=api.staff() }.onFailure { error=it.message ?: "Update failed" } } })
-                "Shifts", "Schedule" -> ShiftPanel(manager, staff, shifts, modifier = Modifier.weight(1f), onSave = { d,t,ids -> scope.launch { runCatching { api.saveShift(d,t,ids); shifts=api.shifts() }.onFailure { error=it.message ?: "Save failed" } } }, onDelete = { id -> scope.launch { runCatching { api.deleteShift(id); shifts=api.shifts() }.onFailure { error=it.message ?: "Delete failed" } } })
-                "Products" -> ProductPanel(products, modifier = Modifier.weight(1f), canUpdateQuantity = manager || shifts.any { it.date == LocalDate.now().toString() && it.type in setOf("morning", "full_day") && profile!!.id in it.memberIds }, onCreate = { n,c,b,e,q -> scope.launch { runCatching { api.createProduct(n,c,b,e,q); products=api.products() }.onFailure { error=it.message ?: "Save failed" } } }, onAddBatch = { id,e,q -> scope.launch { runCatching { api.createBatch(id,e,q); products=api.products() }.onFailure { error=it.message ?: "Batch save failed" } } }, onUpdateQuantity = { id,q -> scope.launch { runCatching { api.updateBatchQuantity(id,q); products=api.products() }.onFailure { error=it.message ?: "Update failed" } } })
-                else -> TaskPanel(manager, tasks, staff, modifier = Modifier.weight(1f), onComplete = { id, done -> scope.launch { runCatching { api.complete(id,done); tasks=api.tasks() }.onFailure { error=it.message ?: "Update failed" } } }, onCreate = { title,date,type,assignee -> scope.launch { runCatching { api.createTask(title,date,type,assignee); tasks=api.tasks() }.onFailure { error=it.message ?: "Create failed" } } }, onUpdate = { id,title,date,type,assignee -> scope.launch { runCatching { api.updateTask(id,title,date,type,assignee); tasks=api.tasks() }.onFailure { error=it.message ?: "Edit failed" } } }, onDelete = { id -> scope.launch { runCatching { api.deleteTask(id); tasks=api.tasks() }.onFailure { error=it.message ?: "Delete failed" } } })
+            AnimatedContent(
+                targetState = page,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                transitionSpec = {
+                    (fadeIn(tween(150)) + slideInHorizontally(tween(150)) { it / 14 }) togetherWith
+                        (fadeOut(tween(100)) + slideOutHorizontally(tween(100)) { -it / 18 })
+                },
+                label = "store-tab-transition"
+            ) { activePage ->
+                when (activePage) {
+                    "Staff" -> ManagerStaff(staff, modifier = Modifier.fillMaxSize(), onCreate = { u, n, p -> scope.launch { runCatching { api.createStaff(u,n,p); staff=api.staff() }.onFailure { error=it.message ?: "Create failed" } } }, onToggle = { id, active -> scope.launch { runCatching { api.setStaffActive(id,active); staff=api.staff() }.onFailure { error=it.message ?: "Update failed" } } })
+                    "Shifts", "Schedule" -> ShiftPanel(manager, staff, shifts, modifier = Modifier.fillMaxSize(), onSave = { d,t,ids -> scope.launch { runCatching { api.saveShift(d,t,ids); shifts=api.shifts() }.onFailure { error=it.message ?: "Save failed" } } }, onDelete = { id -> scope.launch { runCatching { api.deleteShift(id); shifts=api.shifts() }.onFailure { error=it.message ?: "Delete failed" } } })
+                    "Products" -> ProductPanel(products, modifier = Modifier.fillMaxSize(), canUpdateQuantity = manager || shifts.any { it.date == LocalDate.now().toString() && it.type in setOf("morning", "evening", "full_day") && profile!!.id in it.memberIds }, onCreate = { n,c,b,e,q -> scope.launch { runCatching { api.createProduct(n,c,b,e,q); products=api.products() }.onFailure { error=it.message ?: "Save failed" } } }, onAddBatch = { id,e,q -> scope.launch { runCatching { api.createBatch(id,e,q); products=api.products() }.onFailure { error=it.message ?: "Batch save failed" } } }, onUpdateQuantity = { id,q -> scope.launch { runCatching { api.updateBatchQuantity(id,q); products=api.products() }.onFailure { error=it.message ?: "Update failed" } } }, onCheckQuantity = { id,q -> scope.launch { runCatching { api.checkBatchQuantity(id,q); products=api.products() }.onFailure { error=it.message ?: "Count could not be saved" } } })
+                    else -> TaskPanel(manager, tasks, staff, modifier = Modifier.fillMaxSize(), onComplete = { id, done -> scope.launch { runCatching { api.complete(id,done); tasks=api.tasks() }.onFailure { error=it.message ?: "Update failed" } } }, onCreate = { title,date,type,assignee -> scope.launch { runCatching { api.createTask(title,date,type,assignee); tasks=api.tasks() }.onFailure { error=it.message ?: "Create failed" } } }, onUpdate = { id,title,date,type,assignee -> scope.launch { runCatching { api.updateTask(id,title,date,type,assignee); tasks=api.tasks() }.onFailure { error=it.message ?: "Edit failed" } } }, onDelete = { id -> scope.launch { runCatching { api.deleteTask(id); tasks=api.tasks() }.onFailure { error=it.message ?: "Delete failed" } } })
+                }
             }
             if (error.isNotBlank()) Text(storeText(error), color = Color(0xFFFF8A80), fontSize = 12.sp)
         }
@@ -838,11 +864,12 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
     }
 }
 
-@Composable private fun ProductPanel(products: List<StoreProduct>, modifier: Modifier = Modifier, canUpdateQuantity: Boolean, onCreate: (String,String,String,String,Int)->Unit, onAddBatch: (Int,String,Int)->Unit, onUpdateQuantity: (Int,Int)->Unit) {
+@Composable private fun ProductPanel(products: List<StoreProduct>, modifier: Modifier = Modifier, canUpdateQuantity: Boolean, onCreate: (String,String,String,String,Int)->Unit, onAddBatch: (Int,String,Int)->Unit, onUpdateQuantity: (Int,Int)->Unit, onCheckQuantity: (Int,Int)->Unit) {
     var name by remember { mutableStateOf("") }; var category by remember { mutableStateOf("") }; var barcode by remember { mutableStateOf("") }; var expiry by remember { mutableStateOf(LocalDate.now().plusMonths(1).toString()) }; var quantity by remember { mutableStateOf("1") }
     var batchProductId by remember { mutableStateOf<Int?>(null) }; var batchExpanded by remember { mutableStateOf(false) }; var batchExpiry by remember { mutableStateOf(LocalDate.now().plusMonths(2).toString()) }; var batchQuantity by remember { mutableStateOf("1") }
     var query by remember { mutableStateOf("") }; var filter by remember { mutableStateOf("all") }
     var showProductForm by remember { mutableStateOf(false) }; var showBatchForm by remember { mutableStateOf(false) }
+    var countTarget by remember { mutableStateOf<StoreProduct?>(null) }; var countedQuantity by remember { mutableStateOf("") }
     val groupedProducts = remember(products) { products.groupBy { it.id }.toList() }
     val filteredProducts = remember(groupedProducts, query, filter) {
         groupedProducts.filter { (_, batches) ->
@@ -855,13 +882,33 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
             matchesText && matchesStatus
         }.sortedBy { (_, batches) -> batches.minOfOrNull { it.expiry } ?: "9999-12-31" }
     }
-    val criticalCount = products.count { runCatching { java.time.temporal.ChronoUnit.DAYS.between(LocalDate.now(), LocalDate.parse(it.expiry)) }.getOrDefault(Long.MAX_VALUE) in 0..3 }
+    val criticalBatches = products.filter { batch ->
+        val days = runCatching { java.time.temporal.ChronoUnit.DAYS.between(LocalDate.now(), LocalDate.parse(batch.expiry)) }.getOrDefault(Long.MAX_VALUE)
+        days < 0L || days in 0L..3L
+    }
+    val criticalCount = criticalBatches.size
+    val needsPhysicalCount = criticalBatches.filter { it.checkedAt.take(10) != LocalDate.now().toString() }
     LazyColumn(modifier = modifier.fillMaxWidth(), verticalArrangement=Arrangement.spacedBy(10.dp)) {
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 Metric("PRODUCTS", products.distinctBy { it.id }.size.toString(), Modifier.weight(1f))
                 Metric("BATCHES", products.size.toString(), Modifier.weight(1f))
                 Metric("CRITICAL", criticalCount.toString(), Modifier.weight(1f))
+            }
+        }
+        if (needsPhysicalCount.isNotEmpty()) item {
+            PanelCard {
+                Text(if(LocalStoreEnglish.current) "PHYSICAL STOCK CHECK · ${needsPhysicalCount.size} batches" else "بررسی موجودی واقعی · ${needsPhysicalCount.size} سری محصول", color=Color(0xFFFFB454), fontWeight=FontWeight.Bold, fontSize=12.sp)
+                Text(if(LocalStoreEnglish.current) "Please go to the shelf / stockroom, count the actual remaining units, and record the number below." else "لطفاً به قفسه یا انبار بروید، تعداد واقعی باقی‌مانده را بشمارید و ثبت کنید.", color=StoreMuted, fontSize=11.sp)
+                needsPhysicalCount.take(8).forEach { batch ->
+                    Row(Modifier.fillMaxWidth(), verticalAlignment=Alignment.CenterVertically, horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                        Column(Modifier.weight(1f)) {
+                            Text(batch.name, color=StoreInk, fontWeight=FontWeight.SemiBold, fontSize=12.sp)
+                            Text("${displayStoreDate(batch.expiry, LocalStoreEnglish.current)} · ${if(LocalStoreEnglish.current) "system count" else "تعداد سیستمی"}: ${batch.quantity}", color=StoreMuted, fontSize=10.sp)
+                        }
+                        TextButton(onClick={countTarget=batch;countedQuantity=batch.quantity.toString()}, enabled=canUpdateQuantity) { Text(if(LocalStoreEnglish.current) "Count stock" else "ثبت شمارش", color=StoreMint) }
+                    }
+                }
             }
         }
         item {
@@ -933,8 +980,28 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
                             } else Text("${batch.quantity}",color=StoreInk,fontWeight=FontWeight.Bold)
                         }
                     }
+                    if (batch.checkedAt.isNotBlank()) Text(
+                        (if(LocalStoreEnglish.current) "Last physical count: " else "آخرین شمارش واقعی: ") + "${batch.checkedQuantity ?: batch.quantity} · ${batch.checkedBy}",
+                        color=StoreMuted, fontSize=9.sp
+                    )
                 }
             }
         }
+    }
+    if (countTarget != null) {
+        AlertDialog(
+            onDismissRequest = { countTarget = null },
+            title = { Text(if(LocalStoreEnglish.current) "Record physical stock" else "ثبت موجودی واقعی", color=StoreInk) },
+            text = {
+                Column(verticalArrangement=Arrangement.spacedBy(8.dp)) {
+                    Text(countTarget!!.name, color=StoreMuted)
+                    Text(if(LocalStoreEnglish.current) "Count the actual remaining units on the shelf and in the stockroom." else "تعداد واقعی باقی‌مانده در قفسه و انبار را بشمارید.", color=StoreMuted, fontSize=12.sp)
+                    OutlinedTextField(value=countedQuantity, onValueChange={countedQuantity=it.filter(Char::isDigit)}, label={Text(if(LocalStoreEnglish.current) "Actual quantity" else "تعداد واقعی")}, singleLine=true)
+                }
+            },
+            confirmButton = { TextButton(onClick={ val target=countTarget!!; val qty=countedQuantity.toIntOrNull(); if(qty!=null) { onCheckQuantity(target.batchId,qty); countTarget=null } }, enabled=countedQuantity.toIntOrNull()!=null) { Text(if(LocalStoreEnglish.current) "Save count" else "ثبت شمارش", color=StoreMint) } },
+            dismissButton = { TextButton(onClick={countTarget=null}) { Text(if(LocalStoreEnglish.current) "Cancel" else "انصراف", color=StoreMuted) } },
+            containerColor=StoreCard
+        )
     }
 }
