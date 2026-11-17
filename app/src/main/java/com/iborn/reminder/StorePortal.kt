@@ -18,6 +18,11 @@ import androidx.compose.material.icons.rounded.Storefront
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.graphics.Color
@@ -445,7 +450,6 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
     var page by remember { mutableStateOf("Tasks") }
     var error by remember { mutableStateOf("") }; var loading by remember { mutableStateOf(false) }
     var introVisible by remember { mutableStateOf(false) }; var dataReady by remember { mutableStateOf(false) }
-    var sessionChecked by remember { mutableStateOf(false) }
     var connectionState by remember { mutableStateOf(StoreConnectionState.CHECKING) }
     var pendingChanges by remember { mutableIntStateOf(api.pendingCount()) }
 
@@ -482,6 +486,30 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
             finally { loading = false; dataReady = true; pendingChanges = api.pendingCount() }
         }
     }
+    val pullRefreshThreshold = with(androidx.compose.ui.platform.LocalDensity.current) { 72.dp.toPx() }
+    var pullDistance by remember { mutableFloatStateOf(0f) }
+    val pullRefreshConnection = remember(profile?.id, loading, pullRefreshThreshold) {
+        object : NestedScrollConnection {
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput) {
+                    pullDistance = when {
+                        available.y > 0f -> (pullDistance + available.y).coerceAtMost(pullRefreshThreshold * 1.5f)
+                        available.y < 0f -> (pullDistance + available.y).coerceAtLeast(0f)
+                        else -> pullDistance
+                    }
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                val shouldRefresh = pullDistance >= pullRefreshThreshold && !loading && profile != null
+                pullDistance = 0f
+                if (shouldRefresh) refresh()
+                return Velocity.Zero
+            }
+        }
+    }
+
     LaunchedEffect(profile?.id, visible) {
         if (profile != null && visible) {
             var pollCount = 0
@@ -502,26 +530,29 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
         }
     }
     LaunchedEffect(visible) {
-        if (visible && !sessionChecked) {
-            sessionChecked = true
-            if (api.token.isNotBlank()) {
-            loading = true
-            try {
-                dataReady = false
-                profile = api.profile()
-                persistStoreProfile(context, profile)
-                scheduleManagerNightly(context, profile?.role == "manager")
-                introVisible = !context.getSharedPreferences("reminder_store_auth", Context.MODE_PRIVATE).getBoolean("intro_seen", false)
-            } catch (e: StoreHttpException) {
-                if (e.statusCode == 401) { api.clearLocalSession(); profile = null; persistStoreProfile(context, null) }
-                error = if (e.statusCode == 401) "unauthorized" else (e.message ?: "Could not load Store data")
+        if (visible) {
+            if (api.token.isBlank()) {
+                profile = null
+                persistStoreProfile(context, null)
+                onOverview(StoreOverview())
                 dataReady = true
-            } catch (e: Exception) {
-                // Network failures must never erase a valid server session.
-                error = if (e is IOException) "Vpn khod ra roshn konid" else (e.message ?: "Could not load Store data")
-                dataReady = true
-            }
-            loading = false
+            } else {
+                loading = true
+                try {
+                    dataReady = false
+                    profile = api.profile()
+                    persistStoreProfile(context, profile)
+                    scheduleManagerNightly(context, profile?.role == "manager")
+                    introVisible = !context.getSharedPreferences("reminder_store_auth", Context.MODE_PRIVATE).getBoolean("intro_seen", false)
+                } catch (e: StoreHttpException) {
+                    if (e.statusCode == 401) { api.clearLocalSession(); profile = null; persistStoreProfile(context, null) }
+                    error = if (e.statusCode == 401) "unauthorized" else (e.message ?: "Could not load Store data")
+                    dataReady = true
+                } catch (e: Exception) {
+                    error = if (e is IOException) "Vpn khod ra roshn konid" else (e.message ?: "Could not load Store data")
+                    dataReady = true
+                }
+                loading = false
             }
         }
     }
@@ -539,7 +570,7 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
     if (introVisible) { StoreLoadingVideo(context); return }
 
     CompositionLocalProvider(LocalStoreEnglish provides english) {
-    Column(Modifier.fillMaxSize().background(StoreBlack).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(Modifier.fillMaxSize().background(StoreBlack).nestedScroll(pullRefreshConnection).padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column {
                 Text(storeText("STORE WORKSPACE"), color = StoreMint, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.8.sp)
@@ -595,11 +626,6 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
             }
         } else {
             val manager = profile!!.role == "manager"
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Metric("ROLE", if (manager) "MANAGER" else "STAFF", Modifier.weight(1f))
-                Metric("TASKS", tasks.size.toString(), Modifier.weight(1f))
-                Metric("DONE", tasks.count { it.done }.toString(), Modifier.weight(1f))
-            }
             val tabs = if (manager) listOf("Tasks", "Staff", "Shifts", "Products") else listOf("My tasks", "Schedule", "Products")
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 tabs.forEach { tab -> FilterChip(selected = page == tab, onClick = { page = tab }, label = { Text(storeText(tab), fontSize = 11.sp) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = StoreMint, selectedLabelColor = StoreBlack)) }
@@ -612,10 +638,6 @@ fun StorePortal(context: Context, english: Boolean = true, visible: Boolean = tr
                 else -> TaskPanel(manager, tasks, staff, modifier = Modifier.weight(1f), onComplete = { id, done -> scope.launch { runCatching { api.complete(id,done); tasks=api.tasks() }.onFailure { error=it.message ?: "Update failed" } } }, onCreate = { title,date,type,assignee -> scope.launch { runCatching { api.createTask(title,date,type,assignee); tasks=api.tasks() }.onFailure { error=it.message ?: "Create failed" } } }, onUpdate = { id,title,date,type,assignee -> scope.launch { runCatching { api.updateTask(id,title,date,type,assignee); tasks=api.tasks() }.onFailure { error=it.message ?: "Edit failed" } } }, onDelete = { id -> scope.launch { runCatching { api.deleteTask(id); tasks=api.tasks() }.onFailure { error=it.message ?: "Delete failed" } } })
             }
             if (error.isNotBlank()) Text(storeText(error), color = Color(0xFFFF8A80), fontSize = 12.sp)
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                TextButton(onClick = { refresh() }) { Text(storeText("Refresh"), color = StoreMint) }
-                TextButton(onClick = { scope.launch { api.logout(); scheduleManagerNightly(context, false); profile=null; persistStoreProfile(context, null); tasks=emptyList(); staff=emptyList(); shifts=emptyList(); products=emptyList(); page="Tasks"; onOverview(StoreOverview()) } }) { Text(storeText("Log out"), color = StoreMuted) }
-            }
         }
     }
     }
