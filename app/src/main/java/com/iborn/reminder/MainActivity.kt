@@ -430,9 +430,16 @@ class MainActivity : ComponentActivity() {
 
 @Composable private fun ProfileScreen(context: Context, english: Boolean) {
     val storeProfile = remember { context.getSharedPreferences("reminder_store_profile", Context.MODE_PRIVATE) }
-    val displayName = storeProfile.getString("display_name", null)
-    val username = storeProfile.getString("username", null)
-    val role = storeProfile.getString("role", null)
+    val storeApi = remember { StoreApiClient(context) }
+    val scope = rememberCoroutineScope()
+    var storeAccountActive by remember { mutableStateOf(!storeProfile.getString("username", null).isNullOrBlank()) }
+    var loggingOut by remember { mutableStateOf(false) }
+    var displayName by remember { mutableStateOf(storeProfile.getString("display_name", null)) }
+    var username by remember { mutableStateOf(storeProfile.getString("username", null)) }
+    var role by remember { mutableStateOf(storeProfile.getString("role", null)) }
+    val overviewPrefs = context.getSharedPreferences("reminder_local", Context.MODE_PRIVATE)
+    val taskCount = overviewPrefs.getInt("store_task_count", 0)
+    val doneCount = overviewPrefs.getInt("store_done_count", 0)
     Column(Modifier.fillMaxSize().background(JournalPaper).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text(s("PROFILE", "پروفایل", english), color = Mint, fontSize = 10.sp, letterSpacing = 1.6.sp, fontWeight = FontWeight.Bold)
         Text(s("Your account", "حساب کاربری", english), color = JournalInk, fontSize = 28.sp, fontWeight = FontWeight.Bold)
@@ -458,6 +465,45 @@ class MainActivity : ComponentActivity() {
             }
         }
         Text(if (displayName != null) s("Store account information is synced from your active Store session.", "اطلاعات حساب فروشگاه از نشست فعال شما دریافت می‌شود.", english) else s("Connect your Store account to display your name and role here.", "برای نمایش نام و نقش، وارد حساب فروشگاه شوید.", english), color = Muted, fontSize = 11.sp)
+        if (storeAccountActive) {
+            JournalCard(Modifier.fillMaxWidth()) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(s("STORE ACCOUNT", "حساب فروشگاه", english), color = Mint, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ProfileStat(if (role == "manager") "MANAGER" else "STAFF", s("ROLE", "نقش", english), Modifier.weight(1f))
+                        ProfileStat(taskCount.toString(), s("TASKS", "وظایف", english), Modifier.weight(1f))
+                        ProfileStat(doneCount.toString(), s("DONE", "انجام‌شده", english), Modifier.weight(1f))
+                    }
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                loggingOut = true
+                                runCatching { storeApi.logout() }
+                                storeProfile.edit().clear().apply()
+                                displayName = null
+                                username = null
+                                role = null
+                                scheduleManagerNightly(context, false)
+                                storeAccountActive = false
+                                loggingOut = false
+                            }
+                        },
+                        enabled = !loggingOut,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3A252A), contentColor = Color(0xFFFFA6A6))
+                    ) {
+                        Text(s(if (loggingOut) "Signing out…" else "Log out of Store", if (loggingOut) "در حال خروج…" else "خروج از حساب فروشگاه", english), fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun ProfileStat(value: String, label: String, modifier: Modifier = Modifier) {
+    Column(modifier.background(Color(0xFF20232C), RoundedCornerShape(12.dp)).padding(vertical = 10.dp, horizontal = 7.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(value, color = JournalInk, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+        Text(label, color = Muted, fontSize = 9.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
     }
 }
 
